@@ -20,6 +20,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 TEST_URL = "https://www.breitbandmessung.de/test"
 MEASUREMENT_TIMEOUT_SECONDS = 600
 CSV_DOWNLOAD_TIMEOUT_SECONDS = 60
+PARTIAL_DOWNLOAD_SUFFIXES = (".crdownload", ".part", ".tmp")
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,52 +34,31 @@ def parse_args() -> argparse.Namespace:
         help="CSV file to create or append to. Default: %(default)s",
     )
     parser.add_argument(
-        "--browser",
-        "-b",
-        choices=("chrome", "firefox"),
-        default="chrome",
-        help="Browser to automate. Selenium Manager will locate or fetch the driver. Default: %(default)s",
-    )
-    parser.add_argument(
         "--headless",
-        "-h",
+        "-H",
         action="store_true",
         help="Run the browser without opening a visible window.",
     )
     return parser.parse_args()
 
 
-def build_driver(browser: str, download_dir: Path, headless: bool) -> webdriver.Remote:
-    if browser == "chrome":
-        options = webdriver.ChromeOptions()
-        if headless:
-            options.add_argument("--headless=new")
-        options.add_argument("--window-size=1440,1000")
-        options.add_argument("--disable-notifications")
-        options.add_experimental_option(
-            "prefs",
-            {
-                "download.default_directory": str(download_dir),
-                "download.prompt_for_download": False,
-                "download.directory_upgrade": True,
-                "profile.default_content_setting_values.geolocation": 2,
-                "profile.default_content_setting_values.notifications": 2,
-            },
-        )
-        return webdriver.Chrome(options=options)
-
-    options = webdriver.FirefoxOptions()
+def build_driver(download_dir: Path, headless: bool) -> webdriver.Remote:
+    options = webdriver.ChromeOptions()
     if headless:
-        options.add_argument("-headless")
-    options.set_preference("browser.download.folderList", 2)
-    options.set_preference("browser.download.dir", str(download_dir))
-    options.set_preference(
-        "browser.helperApps.neverAsk.saveToDisk",
-        "text/csv,application/csv,application/force-download",
+        options.add_argument("--headless=new")
+    options.add_argument("--window-size=1440,1000")
+    options.add_argument("--disable-notifications")
+    options.add_experimental_option(
+        "prefs",
+        {
+            "download.default_directory": str(download_dir),
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "profile.default_content_setting_values.geolocation": 2,
+            "profile.default_content_setting_values.notifications": 2,
+        },
     )
-    options.set_preference("pdfjs.disabled", True)
-    options.set_preference("geo.enabled", False)
-    return webdriver.Firefox(options=options)
+    return webdriver.Chrome(options=options)
 
 
 def xpath_for_button_text(*texts: str) -> str:
@@ -160,19 +140,53 @@ def export_csv(driver: webdriver.Remote, download_dir: Path) -> Path:
 
     deadline = time.time() + CSV_DOWNLOAD_TIMEOUT_SECONDS
     while time.time() < deadline:
-        candidates = [
-            path
-            for path in download_dir.glob("*")
-            if path.resolve() not in before
-            and path.is_file()
-            and path.suffix.lower() == ".csv"
-            and not path.name.endswith((".crdownload", ".part", ".tmp"))
-        ]
+        candidates = list(finished_downloads(download_dir, before))
         if candidates:
             return max(candidates, key=lambda path: path.stat().st_mtime)
         time.sleep(0.5)
 
-    raise RuntimeError("CSV export did not appear in the download directory.")
+    files = ", ".join(sorted(path.name for path in download_dir.glob("*"))) or "none"
+    raise RuntimeError(
+        f"CSV export did not appear in the download directory ({download_dir}). Files found: {files}"
+    )
+
+
+def finished_downloads(download_dir: Path, before: set[Path]) -> list[Path]:
+    return [
+        path
+        for path in download_dir.glob("*")
+        if path.resolve() not in before
+        and path.is_file()
+        and not path.name.endswith(PARTIAL_DOWNLOAD_SUFFIXES)
+        and looks_like_csv(path)
+        and file_size_is_stable(path)
+    ]
+
+
+def looks_like_csv(path: Path) -> bool:
+    if path.suffix.lower() == ".csv":
+        return True
+
+    try:
+        sample = path.read_bytes()[:2048]
+    except OSError:
+        return False
+
+    return b";" in sample or b"," in sample
+
+
+def file_size_is_stable(path: Path, interval: float = 0.25) -> bool:
+    try:
+        first_size = path.stat().st_size
+    except OSError:
+        return False
+
+    time.sleep(interval)
+
+    try:
+        return path.stat().st_size == first_size and first_size > 0
+    except OSError:
+        return False
 
 
 def append_or_create_csv(downloaded_csv: Path, output_csv: Path) -> None:
@@ -203,16 +217,19 @@ def append_or_create_csv(downloaded_csv: Path, output_csv: Path) -> None:
 def main() -> int:
     args = parse_args()
     output_csv = Path(args.output).expanduser().resolve()
+    temp_root = output_csv.parent
+    temp_root.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="bbm-download-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="bbm-download-", dir=temp_root) as temp_dir:
         download_dir = Path(temp_dir)
-        driver = build_driver(args.browser, download_dir, args.headless)
+        driver = build_driver(download_dir, args.headless)
         try:
             run_measurement(driver)
             downloaded_csv = export_csv(driver, download_dir)
-            append_or_create_csv(downloaded_csv, output_csv)
         finally:
             driver.quit()
+
+        append_or_create_csv(downloaded_csv, output_csv)
 
     print(f"Results saved to: {output_csv}")
     return 0
