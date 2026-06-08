@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import shutil
 import sys
 import tempfile
@@ -28,19 +27,21 @@ def parse_args() -> argparse.Namespace:
         description="Run https://www.breitbandmessung.de/test and save the finished measurement to CSV."
     )
     parser.add_argument(
-        "-o",
         "--output",
+        "-o",
         default="results.csv",
         help="CSV file to create or append to. Default: %(default)s",
     )
     parser.add_argument(
         "--browser",
+        "-b",
         choices=("chrome", "firefox"),
         default="chrome",
         help="Browser to automate. Selenium Manager will locate or fetch the driver. Default: %(default)s",
     )
     parser.add_argument(
         "--headless",
+        "-h",
         action="store_true",
         help="Run the browser without opening a visible window.",
     )
@@ -181,18 +182,22 @@ def append_or_create_csv(downloaded_csv: Path, output_csv: Path) -> None:
         shutil.copyfile(downloaded_csv, output_csv)
         return
 
-    with downloaded_csv.open("r", encoding="utf-8-sig", newline="") as handle:
-        sample = handle.read(4096)
-        handle.seek(0)
-        dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-        rows = list(csv.reader(handle, dialect))
-
-    if len(rows) < 2:
+    lines = downloaded_csv.read_bytes().splitlines(keepends=True)
+    if len(lines) < 2:
         raise RuntimeError(f"Downloaded CSV does not contain a data row: {downloaded_csv}")
 
-    with output_csv.open("a", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle, dialect)
-        writer.writerows(rows[1:])
+    rows_without_header = b"".join(lines[1:])
+    if rows_without_header and rows_without_header[-1:] not in (b"\n", b"\r"):
+        rows_without_header += b"\n"
+
+    with output_csv.open("rb") as handle:
+        handle.seek(-1, 2)
+        last_byte = handle.read(1)
+
+    with output_csv.open("ab") as handle:
+        if last_byte not in (b"\n", b"\r"):
+            handle.write(b"\n")
+        handle.write(rows_without_header)
 
 
 def main() -> int:
